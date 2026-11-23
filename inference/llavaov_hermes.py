@@ -592,13 +592,53 @@ class LlavaOneVision_Hermes(LlavaOnevisionForConditionalGeneration, Abstract_Her
                 refined_scores[i] = (1 - gamma) * score_current + gamma * score_next_interp
             else:
                 refined_scores[i] = (1 - gamma) * score_current + gamma * score_next
-
+        # Dùng cùng k khi so các layer vì long-term có thể được cấp ít hơn 1 slot.
+        probe_k = min(config["budget"] for config in layer_configs)
+        prev_raw_ids = None
+        prev_refined_ids = None
         for layer_idx, score in enumerate(refined_scores):
             config = layer_configs[layer_idx]
             actual_num_keep = config['budget']
             start_idx = config['visual_start_idx']
             
             topk_indices_relative = torch.topk(score, actual_num_keep, sorted=False)[1]
+            import json
+
+            # Mỗi dòng log tương ứng với một layer trong một lần prune.
+            if layer_idx == 0:
+                self.budget_probe_round = getattr(self, "budget_probe_round", 0) + 1
+
+            with torch.no_grad():
+                s = score.detach().float()
+                k = int(actual_num_keep)
+                kept = s[topk_indices_relative]
+                total = s.sum().item()
+
+                # Token tốt nhất trong số những token thực sự bị HERMES loại.
+                dropped_mask = torch.ones_like(s, dtype=torch.bool)
+                dropped_mask[topk_indices_relative] = False
+                dropped = s[dropped_mask]
+
+                row = {
+                    "prune_round": self.budget_probe_round,
+                    "layer_idx": layer_idx,
+                    "visual_tokens": s.numel(),
+                    "budget": k,
+                    "score_range": (s.max() - s.min()).item() if s.numel() else None,
+                    "retained_pct": 100 * kept.sum().item() / total if total > 0 else None,
+                    "last_kept_pct": (
+                        100 * kept.min().item() / total if k > 0 and total > 0 else None
+                    ),
+                    "first_dropped_pct": (
+                        100 * dropped.max().item() / total
+                        if dropped.numel() and total > 0 else None
+                    ),
+                }
+
+                # File riêng cho một lần chạy trên một video.
+                mode = "w" if self.budget_probe_round == 1 and layer_idx == 0 else "a"
+                with open("/content/hermes_budget_probe.jsonl", mode) as f:
+                    f.write(json.dumps(row) + "\n")
             topk_indices_absolute = topk_indices_relative + start_idx
             topk_indices_absolute_sorted = torch.sort(topk_indices_absolute)[0]
             
@@ -662,6 +702,59 @@ class LlavaOneVision_Hermes(LlavaOnevisionForConditionalGeneration, Abstract_Her
 
             print("Common selected tokens:", overlap_count)
             print("Top-k overlap ratio:", f"{overlap_ratio:.2%}")
+            with torch.no_grad():
+                raw = layer_raw_scores[layer_idx].detach()
+
+                # Xếp các token đã được chọn theo score, từ cao xuống thấp.
+                raw_ranked = raw_topk[raw[raw_topk].argsort(descending=True)]
+                refined_ids = topk_indices_relative
+                refined_ranked = refined_ids[score[refined_ids].argsort(descending=True)]
+
+                print(f"\n[TN1 | Trước smoothing | Layer {layer_idx}]")
+                print(f"Visual tokens={raw.numel()} | Budget={actual_num_keep}")
+                print(f"Raw min={raw.min().item():.6f} | "
+                      f"mean={raw.float().mean().item():.6f} | "
+                      f"max={raw.max().item():.6f}")
+
+                # 10 token đứng đầu theo raw score và kết quả thực tế sau smoothing.
+                preview = raw_ranked[:10]
+                survives = torch.isin(preview, refined_ids)
+                print("Rank | Relative | Cache index | Raw score | Refined score | Còn được giữ?")
+                for rank, (idx, raw_s, refined_s, kept) in enumerate(zip(
+                    preview.tolist(),
+                    raw[preview].tolist(),
+                    score[preview].tolist(),
+                    survives.tolist(),
+                ), start=1):
+                    print(f"{rank:4d} | {idx:8d} | {start_idx + idx:11d} | "
+                          f"{raw_s:9.6f} | {refined_s:13.6f} | "
+                          f"{'Có' if kept else 'Không'}")
+
+                # Ở lần prune đầu, dùng relative index nếu các layer nhận cùng
+                # chuỗi visual token theo cùng thứ tự trước khi prune.
+                if self.budget_probe_round == 1 and probe_k > 0:
+                    raw_ids = raw_ranked[:probe_k]
+                    smooth_ids = refined_ranked[:probe_k]
+
+                    if prev_raw_ids is not None:
+                        raw_common = torch.isin(raw_ids, prev_raw_ids).sum().item()
+                        smooth_common = torch.isin(smooth_ids, prev_refined_ids).sum().item()
+
+                        print(f"[TN1 | Layer {layer_idx - 1} và {layer_idx} | k={probe_k}]")
+                        print(f"Overlap trước smoothing: {raw_common}/{probe_k} "
+                              f"({raw_common / probe_k:.2%})")
+                        print(f"Overlap sau smoothing:   {smooth_common}/{probe_k} "
+                              f"({smooth_common / probe_k:.2%})")
+
+                    prev_raw_ids = raw_ids
+                    prev_refined_ids = smooth_ids
+
+                # In luôn các số mà thí nghiệm 2 đã ghi vào JSONL.
+                print(f"[TN2 | Layer {layer_idx}]",
+                      {key: row[key] for key in (
+                          "score_range", "retained_pct",
+                          "last_kept_pct", "first_dropped_pct",
+                      )})
 
             # 4. Selected indices
             print("\n[Selected Indices]")

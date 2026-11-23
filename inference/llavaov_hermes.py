@@ -474,294 +474,211 @@ class LlavaOneVision_Hermes(LlavaOnevisionForConditionalGeneration, Abstract_Her
         
         return attention_weights_list
 
-    def prune_kv_cache_by_attention(self, attn_weights_local, attn_weights_global, attn_weights_mixed, num_keep=3000):
-        """
-        attn_weights_local: shallow layer
-        attn_weights_global: deep layer
-        attn_weights_mixed: middle layer
-        """
+    def prune_kv_cache_by_attention(
+        self,
+        attn_weights_local,
+        attn_weights_global,
+        attn_weights_mixed,
+        num_keep=3000,
+    ):
+        import csv
+        import json
+
+        import torch
+        import torch.nn.functional as F
+
         device = self.device
         visual_start_idx = self.visual_start_idx
         num_layers = len(attn_weights_local)
-        
         curr_cache_lens = self._get_cache_seq_len_per_layer()
-        
-        question_len_local = attn_weights_local[0].shape[2]
-        question_len_global = attn_weights_global[0].shape[2]
-        question_len_mixed = attn_weights_mixed[0].shape[2]
 
         total_budget = num_keep * num_layers
         budget_per_layer = self.allocate_budget_by_depth(total_budget, num_layers)
-        
-        keep_indices_all_layers = []
 
         layer_raw_scores = []
         layer_configs = []
+        keep_indices_all_layers = []
 
-        for layer_idx in range(len(attn_weights_local)):
+        # 1. Tính raw retention score cho từng visual token ở từng layer.
+        for layer_idx in range(num_layers):
             curr_len = curr_cache_lens[layer_idx]
-            if self.token_activity_cache[layer_idx] is None:
-                self.token_activity_cache[layer_idx] = torch.zeros(curr_len, device=device, dtype=torch.float32)
-            elif self.token_activity_cache[layer_idx].shape[0] < curr_len:
-                diff = curr_len - self.token_activity_cache[layer_idx].shape[0]
-                zeros = torch.zeros(diff, device=device, dtype=torch.float32)
-                self.token_activity_cache[layer_idx] = torch.cat([self.token_activity_cache[layer_idx], zeros])
-            
-            if self.token_activity_cache[layer_idx].shape[0] > curr_len:
-                 self.token_activity_cache[layer_idx] = self.token_activity_cache[layer_idx][:curr_len]
+            activity = self.token_activity_cache[layer_idx]
 
-            # Memory hierarchy mode
+            if activity is None:
+                activity = torch.zeros(curr_len, device=device, dtype=torch.float32)
+            elif activity.shape[0] < curr_len:
+                extra = activity.new_zeros(curr_len - activity.shape[0])
+                activity = torch.cat([activity, extra])
+            elif activity.shape[0] > curr_len:
+                activity = activity[:curr_len]
+
+            self.token_activity_cache[layer_idx] = activity
+
             if layer_idx < self.short_term_threshold:
                 layer_type = "short-term"
-                layer_attn_weights = attn_weights_local[layer_idx]
-                question_len = question_len_local
-                layer_recency_alpha = 1
-                k = 20
-                
+                attn = attn_weights_local[layer_idx]
+                recency_alpha = 1.0
+                decay = 20.0
             elif layer_idx >= self.long_term_threshold:
                 layer_type = "long-term"
-                layer_attn_weights = attn_weights_global[layer_idx]
-                question_len = question_len_global
-                layer_recency_alpha = 0
-                k = 0.0
-                
+                attn = attn_weights_global[layer_idx]
+                recency_alpha = 0.0
+                decay = 0.0
             else:
                 layer_type = "mid-term"
-                layer_attn_weights = attn_weights_mixed[layer_idx]
-                question_len = question_len_mixed
-                progress = (layer_idx - self.short_term_threshold) / (self.long_term_threshold - self.short_term_threshold)
-                layer_recency_alpha = 1.0 - 0.9 * progress
-                k = 20 - 19.5 * progress
-            
-            visual_attn_weights = layer_attn_weights[0].mean(dim=0)[:,visual_start_idx:-1*question_len].mean(dim=0)
-            num_visual_tokens = visual_attn_weights.shape[0]
-            
+                attn = attn_weights_mixed[layer_idx]
+                progress = (
+                    (layer_idx - self.short_term_threshold)
+                    / (self.long_term_threshold - self.short_term_threshold)
+                )
+                recency_alpha = 1.0 - 0.9 * progress
+                decay = 20.0 - 19.5 * progress
+
+            question_len = attn.shape[2]
+            visual_attn = attn[0].mean(dim=0)[:, visual_start_idx:-question_len]
+            visual_attn = visual_attn.mean(dim=0)
+            num_visual_tokens = visual_attn.numel()
+
             end_idx = visual_start_idx + num_visual_tokens
-            if end_idx <= self.token_activity_cache[layer_idx].shape[0]:
-                self.token_activity_cache[layer_idx][visual_start_idx:end_idx] += visual_attn_weights
-            
+            if end_idx <= activity.shape[0]:
+                activity[visual_start_idx:end_idx] += visual_attn
+
             layer_budget = budget_per_layer[layer_idx]
-            
-            if layer_type == 'long-term':
+            if layer_type == "long-term":
                 layer_budget = max(0, layer_budget - 1)
 
-            positions = torch.arange(num_visual_tokens, device=device, dtype=torch.float32)
-            time_distances = (num_visual_tokens - 1 - positions) / max(num_visual_tokens - 1, 1)
-            
-            # Exponential decay
-            recency_weights = torch.exp(-k * time_distances)
-            
-            attn_norm = (visual_attn_weights - visual_attn_weights.min()) / \
-                        (visual_attn_weights.max() - visual_attn_weights.min() + 1e-6)
-            recency_norm = (recency_weights - recency_weights.min()) / \
-                        (recency_weights.max() - recency_weights.min() + 1e-6)
-            
-            raw_score = attn_norm * (1 - layer_recency_alpha) + recency_norm * layer_recency_alpha
-            
+            positions = torch.arange(
+                num_visual_tokens, device=device, dtype=torch.float32
+            )
+            time_distances = (
+                (num_visual_tokens - 1 - positions) / max(num_visual_tokens - 1, 1)
+            )
+            recency_weights = torch.exp(-decay * time_distances)
+
+            attn_norm = (visual_attn - visual_attn.min()) / (
+                visual_attn.max() - visual_attn.min() + 1e-6
+            )
+            recency_norm = (recency_weights - recency_weights.min()) / (
+                recency_weights.max() - recency_weights.min() + 1e-6
+            )
+
+            raw_score = attn_norm * (1 - recency_alpha) + recency_norm * recency_alpha
             layer_raw_scores.append(raw_score)
             layer_configs.append({
-                'budget': min(layer_budget, num_visual_tokens),
-                'layer_type': layer_type,
-                'visual_start_idx': visual_start_idx
+                "layer_type": layer_type,
+                "budget": min(layer_budget, num_visual_tokens),
             })
-        
-        refined_scores = [s.clone() for s in layer_raw_scores]
-        
-        for i in range(len(refined_scores) - 2, -1, -1):
-            current_type = layer_configs[i]['layer_type']
-            
-            # TODO: change hard code here
-            if current_type == 'long-term':
-                gamma = 0.4  
-            elif current_type == 'mid-term':
-                gamma = 0.3  
-            else:
-                gamma = 0.1
-            
-            score_current = refined_scores[i]
-            score_next = refined_scores[i+1]
-            
-            if score_current.shape[0] != score_next.shape[0]:
-                score_next_reshaped = score_next.view(1, 1, -1)
-                score_next_interp = F.interpolate(
-                    score_next_reshaped, 
-                    size=score_current.shape[0], 
-                    mode='linear', 
-                    align_corners=False
+
+        # 2. Smooth score từ layer sâu về layer nông.
+        refined_scores = [raw.clone() for raw in layer_raw_scores]
+        gamma_by_type = {"short-term": 0.1, "mid-term": 0.3, "long-term": 0.4}
+
+        for i in range(num_layers - 2, -1, -1):
+            gamma = gamma_by_type[layer_configs[i]["layer_type"]]
+            current_score = refined_scores[i]
+            next_score = refined_scores[i + 1]
+
+            if current_score.numel() != next_score.numel():
+                next_score = F.interpolate(
+                    next_score.view(1, 1, -1),
+                    size=current_score.numel(),
+                    mode="linear",
+                    align_corners=False,
                 ).view(-1)
-                refined_scores[i] = (1 - gamma) * score_current + gamma * score_next_interp
-            else:
-                refined_scores[i] = (1 - gamma) * score_current + gamma * score_next
-        # Dùng cùng k khi so các layer vì long-term có thể được cấp ít hơn 1 slot.
-        probe_k = min(config["budget"] for config in layer_configs)
-        prev_raw_ids = None
-        prev_refined_ids = None
-        for layer_idx, score in enumerate(refined_scores):
-            config = layer_configs[layer_idx]
-            actual_num_keep = config['budget']
-            start_idx = config['visual_start_idx']
-            
-            topk_indices_relative = torch.topk(score, actual_num_keep, sorted=False)[1]
-            import json
 
-            # Mỗi dòng log tương ứng với một layer trong một lần prune.
-            if layer_idx == 0:
-                self.budget_probe_round = getattr(self, "budget_probe_round", 0) + 1
+            refined_scores[i] = (1 - gamma) * current_score + gamma * next_score
 
-            with torch.no_grad():
-                s = score.detach().float()
-                k = int(actual_num_keep)
-                kept = s[topk_indices_relative]
-                total = s.sum().item()
+        # 3. Chọn token, ghi toàn bộ điểm và in một dòng cho mỗi layer.
+        self.budget_probe_round = getattr(self, "budget_probe_round", 0) + 1
+        round_id = self.budget_probe_round
+        mode = "w" if round_id == 1 else "a"
 
-                # Token tốt nhất trong số những token thực sự bị HERMES loại.
-                dropped_mask = torch.ones_like(s, dtype=torch.bool)
-                dropped_mask[topk_indices_relative] = False
-                dropped = s[dropped_mask]
+        token_path = "/content/hermes_selected_tokens.csv"
+        probe_path = "/content/hermes_budget_probe.jsonl"
+
+        with (
+            torch.no_grad(),
+            open(token_path, mode, newline="", encoding="utf-8") as token_file,
+            open(probe_path, mode, encoding="utf-8") as probe_file,
+        ):
+            writer = csv.writer(token_file)
+            if round_id == 1:
+                writer.writerow([
+                    "prune_round", "layer", "rank_after", "relative_idx",
+                    "cache_idx", "raw_score", "refined_score",
+                ])
+
+            for layer_idx, score in enumerate(refined_scores):
+                raw = layer_raw_scores[layer_idx]
+                config = layer_configs[layer_idx]
+                k = config["budget"]
+
+                # Đây là tập token HERMES thực sự chọn để giữ.
+                kept_ids = torch.topk(score, k, sorted=False).indices
+
+                # Cache cần các token theo thứ tự vị trí ban đầu.
+                cache_ids = (kept_ids + visual_start_idx).sort().values
+                prefix_ids = torch.arange(visual_start_idx, device=device)
+                keep_indices = torch.cat([prefix_ids, cache_ids]).tolist()
+                keep_indices_all_layers.append(keep_indices)
+
+                # CSV dùng cùng tập token, xếp theo refined_score giảm dần.
+                ranked_ids = kept_ids[score[kept_ids].argsort(descending=True)]
+                relative_ids = ranked_ids.tolist()
+                raw_values = raw[ranked_ids].tolist()
+                refined_values = score[ranked_ids].tolist()
+
+                writer.writerows(
+                    (round_id, layer_idx, rank, idx, visual_start_idx + idx, raw_s, refined_s)
+                    for rank, (idx, raw_s, refined_s) in enumerate(
+                        zip(relative_ids, raw_values, refined_values), start=1
+                    )
+                )
+
+                # So sánh top-k trước và sau smoothing tại cùng layer.
+                raw_topk = torch.topk(raw, k, sorted=False).indices
+                kept_mask = torch.zeros_like(score, dtype=torch.bool)
+                kept_mask[kept_ids] = True
+                common = kept_mask[raw_topk].sum().item()
+                overlap = common / k if k else 0.0
+
+                # Giữ các chỉ số budget probe trong JSONL như ở hàm cũ.
+                scores_fp32 = score.float()
+                dropped = scores_fp32[~kept_mask]
+                total = scores_fp32.sum().item()
 
                 row = {
-                    "prune_round": self.budget_probe_round,
+                    "prune_round": round_id,
                     "layer_idx": layer_idx,
-                    "visual_tokens": s.numel(),
+                    "visual_tokens": score.numel(),
                     "budget": k,
-                    "score_range": (s.max() - s.min()).item() if s.numel() else None,
-                    "retained_pct": 100 * kept.sum().item() / total if total > 0 else None,
+                    "score_range": (scores_fp32.max() - scores_fp32.min()).item(),
+                    "retained_pct": (
+                        100 * scores_fp32[kept_ids].sum().item() / total
+                        if total > 0 else None
+                    ),
                     "last_kept_pct": (
-                        100 * kept.min().item() / total if k > 0 and total > 0 else None
+                        100 * refined_values[-1] / total if k and total > 0 else None
                     ),
                     "first_dropped_pct": (
                         100 * dropped.max().item() / total
                         if dropped.numel() and total > 0 else None
                     ),
                 }
+                probe_file.write(json.dumps(row) + "\n")
 
-                # File riêng cho một lần chạy trên một video.
-                mode = "w" if self.budget_probe_round == 1 and layer_idx == 0 else "a"
-                with open("/content/hermes_budget_probe.jsonl", mode) as f:
-                    f.write(json.dumps(row) + "\n")
-            topk_indices_absolute = topk_indices_relative + start_idx
-            topk_indices_absolute_sorted = torch.sort(topk_indices_absolute)[0]
-            
-            keep_indices = torch.cat([
-                torch.arange(start_idx, device=device), 
-                topk_indices_absolute_sorted
-            ]).tolist()
-            
-            keep_indices_all_layers.append(keep_indices)
-            print(f"\n{'='*65}")
-            print(f"Layer {layer_idx} | Type: {config['layer_type']}")
-            print(f"{'='*65}")
-
-            print("Total layers:", len(refined_scores))
-            print("Visual start idx:", start_idx)
-            print("Visual tokens:", score.numel())
-            print("Budget:", actual_num_keep)
-            print("Pruned tokens:", score.numel() - actual_num_keep)
-            print("Keep indices:", len(keep_indices))
-
-            # 1. Score statistics
-            print("\n[Score Statistics]")
-            print("Raw score shape:", tuple(layer_raw_scores[layer_idx].shape))
-            print("Refined score shape:", tuple(score.shape))
-            print("Raw score mean:", layer_raw_scores[layer_idx].mean().item())
-            print("Refined score mean:", score.mean().item())
-            print("Refined score min:", score.min().item())
-            print("Refined score max:", score.max().item())
-
-            # 2. Top 10 tokens thực sự có score cao nhất
-            print("\n[Top 10 Important Tokens]")
-
-            top_values, top_indices = torch.topk(
-                score, min(10, score.numel()), sorted=True
-            )
-
-            for relative_idx, value in zip(top_indices.tolist(), top_values.tolist()):
-                print(
-                    f"Relative={relative_idx}, "
-                    f"Absolute={relative_idx + start_idx}, "
-                    f"Score={value:.6f}"
+                summary = (
+                    f"Lượt {round_id} | Layer {layer_idx:02d} | "
+                    f"Giữ {k}/{score.numel()} visual token"
                 )
+                if k:
+                    summary += (
+                        f" | Max {refined_values[0]:.6g}"
+                        f" | Min {refined_values[-1]:.6g}"
+                        f" | Overlap {overlap:.1%}"
+                    )
+                print(summary)
 
-            # 3. So sánh trước và sau cross-layer smoothing
-            print("\n[Smoothing Effect]")
-
-            raw_topk = torch.topk(
-                layer_raw_scores[layer_idx],
-                actual_num_keep,
-                sorted=False
-            ).indices
-
-            refined_topk = topk_indices_relative
-
-            overlap_count = torch.isin(raw_topk, refined_topk).sum().item()
-
-            overlap_ratio = (
-                overlap_count / actual_num_keep
-                if actual_num_keep > 0 else 0
-            )
-
-            print("Common selected tokens:", overlap_count)
-            print("Top-k overlap ratio:", f"{overlap_ratio:.2%}")
-            with torch.no_grad():
-                raw = layer_raw_scores[layer_idx].detach()
-
-                # Xếp các token đã được chọn theo score, từ cao xuống thấp.
-                raw_ranked = raw_topk[raw[raw_topk].argsort(descending=True)]
-                refined_ids = topk_indices_relative
-                refined_ranked = refined_ids[score[refined_ids].argsort(descending=True)]
-
-                print(f"\n[TN1 | Trước smoothing | Layer {layer_idx}]")
-                print(f"Visual tokens={raw.numel()} | Budget={actual_num_keep}")
-                print(f"Raw min={raw.min().item():.6f} | "
-                      f"mean={raw.float().mean().item():.6f} | "
-                      f"max={raw.max().item():.6f}")
-
-                # 10 token đứng đầu theo raw score và kết quả thực tế sau smoothing.
-                preview = raw_ranked[:10]
-                survives = torch.isin(preview, refined_ids)
-                print("Rank | Relative | Cache index | Raw score | Refined score | Còn được giữ?")
-                for rank, (idx, raw_s, refined_s, kept) in enumerate(zip(
-                    preview.tolist(),
-                    raw[preview].tolist(),
-                    score[preview].tolist(),
-                    survives.tolist(),
-                ), start=1):
-                    print(f"{rank:4d} | {idx:8d} | {start_idx + idx:11d} | "
-                          f"{raw_s:9.6f} | {refined_s:13.6f} | "
-                          f"{'Có' if kept else 'Không'}")
-
-                # Ở lần prune đầu, dùng relative index nếu các layer nhận cùng
-                # chuỗi visual token theo cùng thứ tự trước khi prune.
-                if self.budget_probe_round == 1 and probe_k > 0:
-                    raw_ids = raw_ranked[:probe_k]
-                    smooth_ids = refined_ranked[:probe_k]
-
-                    if prev_raw_ids is not None:
-                        raw_common = torch.isin(raw_ids, prev_raw_ids).sum().item()
-                        smooth_common = torch.isin(smooth_ids, prev_refined_ids).sum().item()
-
-                        print(f"[TN1 | Layer {layer_idx - 1} và {layer_idx} | k={probe_k}]")
-                        print(f"Overlap trước smoothing: {raw_common}/{probe_k} "
-                              f"({raw_common / probe_k:.2%})")
-                        print(f"Overlap sau smoothing:   {smooth_common}/{probe_k} "
-                              f"({smooth_common / probe_k:.2%})")
-
-                    prev_raw_ids = raw_ids
-                    prev_refined_ids = smooth_ids
-
-                # In luôn các số mà thí nghiệm 2 đã ghi vào JSONL.
-                print(f"[TN2 | Layer {layer_idx}]",
-                      {key: row[key] for key in (
-                          "score_range", "retained_pct",
-                          "last_kept_pct", "first_dropped_pct",
-                      )})
-
-            # 4. Selected indices
-            print("\n[Selected Indices]")
-            print("Top-k relative shape:", tuple(topk_indices_relative.shape))
-            print("Top-k absolute shape:", tuple(topk_indices_absolute.shape))
-            print("First 10 sorted visual indices:",topk_indices_absolute_sorted[:10].tolist())
-        
         return keep_indices_all_layers
 
     
